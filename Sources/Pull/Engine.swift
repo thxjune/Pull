@@ -177,6 +177,9 @@ struct Engine {
             "-o", template,
             "--print", "after_move:filepath",
             "--no-simulate",
+            // Fetch 8 stream fragments in parallel — big speedup on
+            // YouTube/HLS/DASH, harmless elsewhere.
+            "-N", "8",
         ] + extractorArgs
 
         // For Instagram/TikTok posts that require being logged in.
@@ -248,6 +251,10 @@ struct Engine {
             proc.arguments = args
             var env = ProcessInfo.processInfo.environment
             env["PATH"] = Tools.searchPaths.joined(separator: ":")
+            // yt-dlp is Python: without this, its progress lines sit in an 8KB
+            // pipe buffer and arrive in one burst at the end — the UI bar would
+            // jump 0 → done. Unbuffered = live progress.
+            env["PYTHONUNBUFFERED"] = "1"
             proc.environment = env
 
             let outPipe = Pipe(), errPipe = Pipe()
