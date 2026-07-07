@@ -139,11 +139,13 @@ struct Engine {
         ] + extractorArgs
 
         if let v = video {
-            // Best video at the chosen height + best audio, merged into MP4.
-            args += [
-                "-f", "bv*[height<=\(v.height)]+ba/b[height<=\(v.height)]",
-                "--merge-output-format", "mp4",
-            ]
+            // ≤1080p: prefer H.264 + AAC — plays on literally everything.
+            // Above 1080p YouTube only serves VP9/AV1 — prefer AV1 (better
+            // quality per byte, native playback on modern Macs).
+            let sort = v.height <= 1080
+                ? "res:\(v.height),vcodec:h264,acodec:m4a"
+                : "res:\(v.height),vcodec:av01"
+            args += ["-f", "bv*+ba/b", "-S", sort, "--merge-output-format", "mp4"]
         } else if let a = audio {
             switch a.kind {
             case .original:

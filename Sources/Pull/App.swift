@@ -13,6 +13,22 @@ struct PullApp: App {
                 .background(Color(hex: 0x0B0B0C))
                 .preferredColorScheme(.dark)
                 .onAppear { state.adoptClipboardIfURL() }
+                .onReceive(NotificationCenter.default.publisher(
+                    for: NSApplication.didBecomeActiveNotification)) { _ in
+                    state.adoptClipboardIfURL()
+                }
+                .onDrop(of: [.url, .text], isTargeted: nil) { providers in
+                    _ = providers.first?.loadObject(ofClass: NSString.self) { s, _ in
+                        if let str = (s as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                           str.hasPrefix("http") {
+                            Task { @MainActor in
+                                state.urlText = str
+                                state.probe()
+                            }
+                        }
+                    }
+                    return true
+                }
         }
         .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentMinSize)
@@ -33,15 +49,56 @@ final class AppState: ObservableObject {
     @Published var progress: Double = 0
     @Published var errorText: String?
     @Published var history: [HistoryItem] = []
+    @Published var outputDir: URL
 
-    let outputDir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
+    private var lastClipboard = ""
+    private let historyFile: URL
 
-    // If the clipboard holds a link when the app opens, offer it instantly.
+    init() {
+        let saved = UserDefaults.standard.string(forKey: "pull.outputDir")
+        outputDir = saved.map { URL(fileURLWithPath: $0) }
+            ?? FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
+
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Pull", isDirectory: true)
+        try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        historyFile = support.appendingPathComponent("history.json")
+        if let data = try? Data(contentsOf: historyFile),
+           let items = try? JSONDecoder().decode([HistoryItem].self, from: data) {
+            history = items
+        }
+    }
+
+    // Whenever the app comes to the front with a fresh link on the clipboard,
+    // grab it and probe it — zero clicks.
     func adoptClipboardIfURL() {
-        guard urlText.isEmpty, info == nil,
+        guard !downloading, !probing,
               let s = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              s.hasPrefix("http"), s.count < 500 else { return }
+              s.hasPrefix("http"), s.count < 500, s != lastClipboard, s != urlText,
+              s != info?.url else { return }
+        lastClipboard = s
         urlText = s
+        probe()
+    }
+
+    func chooseOutputDir() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = outputDir
+        panel.prompt = "Save here"
+        if panel.runModal() == .OK, let url = panel.url {
+            outputDir = url
+            UserDefaults.standard.set(url.path, forKey: "pull.outputDir")
+        }
+    }
+
+    private func persistHistory() {
+        let capped = Array(history.prefix(50))
+        if let data = try? JSONEncoder().encode(capped) {
+            try? data.write(to: historyFile, options: .atomic)
+        }
     }
 
     func probe() {
@@ -90,11 +147,13 @@ final class AppState: ObservableObject {
                     title: info.title,
                     detail: "\(detail) · \(Format.size(size))",
                     fileURL: file, failed: false), at: 0)
+                self.persistHistory()
                 self.reset()
             } catch {
                 self.errorText = error.localizedDescription
                 self.history.insert(HistoryItem(
                     title: info.title, detail: detail, fileURL: nil, failed: true), at: 0)
+                self.persistHistory()
                 self.downloading = false
             }
         }

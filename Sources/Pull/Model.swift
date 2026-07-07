@@ -29,7 +29,10 @@ struct VideoOption: Identifiable, Hashable {
 
     var label: String {
         let fpsPart = (fps ?? 0) > 40 ? "\(fps!)" : ""
-        return "\(height)p\(fpsPart)"
+        let base = "\(height)p\(fpsPart)"
+        if height >= 2160 { return "4K · \(base)" }
+        if height >= 1440 { return "2K · \(base)" }
+        return base
     }
     var sizeLabel: String { Format.size(estimatedBytes) }
 }
@@ -70,9 +73,9 @@ enum Format {
     }
 }
 
-// One finished (or failed) download in this session.
-struct HistoryItem: Identifiable {
-    let id = UUID()
+// One finished (or failed) download. Persisted across launches.
+struct HistoryItem: Identifiable, Codable {
+    var id = UUID()
     let title: String
     let detail: String            // "1080p MP4 · 145 MB" / "MP3 · 9.8 MB"
     let fileURL: URL?

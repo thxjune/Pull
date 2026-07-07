@@ -222,9 +222,13 @@ struct MediaCard: View {
                     }
                     .buttonStyle(.plain)
                 }
-                Text("saves to Downloads")
-                    .font(.system(size: 10.5, design: .monospaced))
-                    .foregroundStyle(Mono.faint)
+                Button { state.chooseOutputDir() } label: {
+                    Text("saves to \(state.outputDir.lastPathComponent) — change")
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .foregroundStyle(Mono.faint)
+                        .underline()
+                }
+                .buttonStyle(.plain)
             }
             .padding(16)
         }
