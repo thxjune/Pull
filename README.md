@@ -11,6 +11,12 @@
 
 ---
 
+<p align="center">
+  <a href="https://github.com/thxjune/Pull/releases/latest"><b>⬇ Download the app</b></a> — no build needed. Unzip, right-click → Open. (Engine: <code>brew install yt-dlp ffmpeg</code>)
+</p>
+
+---
+
 ## Features
 
 - 🎬 **Every quality the video has** — 4K/2K/1080p… with file sizes shown *before* you download
