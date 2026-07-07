@@ -42,7 +42,44 @@ struct Engine {
     // fallback fixes it. Scoped to youtube: — harmless for every other site.
     static let extractorArgs = ["--extractor-args", "youtube:player_client=default,android"]
 
+    enum ProbeResult {
+        case single(MediaInfo)
+        case playlist(PlaylistInfo)
+    }
+
     // ── Probe: what is this link? ──────────────────────────────
+    static func probeAny(url: String) async throws -> ProbeResult {
+        // Playlist-shaped URLs get a fast flat probe (no per-entry format fetch).
+        let lower = url.lowercased()
+        let looksLikePlaylist = lower.contains("/playlist") || lower.contains("/sets/")
+            || (lower.contains("list=") && !lower.contains("v="))
+        if looksLikePlaylist, let pl = try? await probePlaylist(url: url), pl.entries.count > 1 {
+            return .playlist(pl)
+        }
+        return .single(try await probe(url: url))
+    }
+
+    static func probePlaylist(url: String) async throws -> PlaylistInfo {
+        guard let ytdlp = Tools.ytdlp else { throw EngineError.toolsMissing }
+        let (out, err, code) = try await run(ytdlp, ["-J", "--flat-playlist", "--no-warnings"] + extractorArgs + [url])
+        guard code == 0, let data = out.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              (json["_type"] as? String) == "playlist",
+              let rawEntries = json["entries"] as? [[String: Any]] else {
+            throw EngineError.probeFailed(tail(err))
+        }
+        let entries: [(String, String)] = rawEntries.compactMap { e in
+            guard let u = (e["url"] as? String) ?? (e["webpage_url"] as? String) else { return nil }
+            return ((e["title"] as? String) ?? "Untitled", u)
+        }
+        return PlaylistInfo(
+            url: url,
+            title: (json["title"] as? String) ?? "Playlist",
+            uploader: (json["uploader"] as? String) ?? "",
+            entries: entries
+        )
+    }
+
     static func probe(url: String) async throws -> MediaInfo {
         guard let ytdlp = Tools.ytdlp else { throw EngineError.toolsMissing }
         let (out, err, code) = try await run(ytdlp, ["-J", "--no-playlist", "--no-warnings"] + extractorArgs + [url])
@@ -119,13 +156,17 @@ struct Engine {
     }
 
     // ── Download ───────────────────────────────────────────────
-    // Returns the final file URL. Progress callback gets 0…1.
+    // The single active process, so the queue can cancel it.
+    private static let activeProcess = ProcessBox()
+    static func cancelActive() { activeProcess.value?.terminate() }
+
+    // Returns the final file URL. Progress callback gets (0…1, "2.1 MiB/s · ETA 0:12").
     static func download(
-        info: MediaInfo,
-        video: VideoOption?,
-        audio: AudioOption?,
+        url: String,
+        selection: Selection,
         outputDir: URL,
-        progress: @escaping @Sendable (Double) -> Void
+        useBrowserCookies: Bool,
+        progress: @escaping @Sendable (Double, String?) -> Void
     ) async throws -> URL {
         guard let ytdlp = Tools.ytdlp, let ffdir = Tools.ffmpegDir else { throw EngineError.toolsMissing }
 
@@ -138,44 +179,54 @@ struct Engine {
             "--no-simulate",
         ] + extractorArgs
 
-        if let v = video {
+        // For Instagram/TikTok posts that require being logged in.
+        if useBrowserCookies { args += ["--cookies-from-browser", "chrome"] }
+
+        switch selection {
+        case .video(let maxHeight):
             // ≤1080p: prefer H.264 + AAC — plays on literally everything.
             // Above 1080p YouTube only serves VP9/AV1 — prefer AV1 (better
             // quality per byte, native playback on modern Macs).
-            let sort = v.height <= 1080
-                ? "res:\(v.height),vcodec:h264,acodec:m4a"
-                : "res:\(v.height),vcodec:av01"
+            let sort = maxHeight <= 1080
+                ? "res:\(maxHeight),vcodec:h264,acodec:m4a"
+                : "res:\(maxHeight),vcodec:av01"
             args += ["-f", "bv*+ba/b", "-S", sort, "--merge-output-format", "mp4"]
-        } else if let a = audio {
-            switch a.kind {
-            case .original:
-                // -x with "best" copies the source stream into its native
-                // container — NO re-encode, bit-identical audio.
-                args += ["-f", "ba[ext=m4a]/bestaudio/best", "-x", "--audio-format", "best"]
-            case .mp3:
-                // V0 VBR — the highest practical MP3 quality.
-                args += ["-f", "ba[ext=m4a]/bestaudio/best", "-x", "--audio-format", "mp3", "--audio-quality", "0"]
-            }
+        case .audioOriginal:
+            // -x with "best" copies the source stream into its native
+            // container — NO re-encode, bit-identical audio.
+            args += ["-f", "ba[ext=m4a]/bestaudio/best", "-x", "--audio-format", "best"]
+        case .audioMP3:
+            // V0 VBR — the highest practical MP3 quality.
+            args += ["-f", "ba[ext=m4a]/bestaudio/best", "-x", "--audio-format", "mp3", "--audio-quality", "0"]
         }
-        args.append(info.url)
+        args.append(url)
 
         let pathBox = PathBox()
-        let (_, err, code) = try await run(ytdlp, args) { line in
+        let (_, err, code) = try await run(ytdlp, args, trackAs: activeProcess) { line in
             if line.hasPrefix("/") { pathBox.value = line }   // --print after_move:filepath
-            if let pct = parseProgress(line) { progress(pct) }
+            if let (pct, rate) = parseProgress(line) { progress(pct, rate) }
         }
         guard code == 0, let path = pathBox.value else {
+            if code == 15 || code == -15 { throw EngineError.downloadFailed("Cancelled.") }
             throw EngineError.downloadFailed(tail(err))
         }
         return URL(fileURLWithPath: path)
     }
 
-    // "[download]  42.3% of 10.55MiB at 2.1MiB/s" → 0.423
-    private static func parseProgress(_ line: String) -> Double? {
+    // "[download]  42.3% of 10.55MiB at 2.1MiB/s ETA 00:12" → (0.423, "2.1MiB/s · ETA 00:12")
+    private static func parseProgress(_ line: String) -> (Double, String?)? {
         guard line.hasPrefix("[download]") else { return nil }
         guard let range = line.range(of: #"(\d{1,3}(?:\.\d+)?)%"#, options: .regularExpression) else { return nil }
-        let num = line[range].dropLast()
-        return Double(num).map { $0 / 100 }
+        let pct = Double(line[range].dropLast()).map { $0 / 100 }
+        var rate: String?
+        if let atRange = line.range(of: #"at\s+\S+"#, options: .regularExpression) {
+            var parts = [String(line[atRange].dropFirst(3))]
+            if let etaRange = line.range(of: #"ETA\s+\S+"#, options: .regularExpression) {
+                parts.append(String(line[etaRange]))
+            }
+            rate = parts.joined(separator: " · ")
+        }
+        return pct.map { ($0, rate) }
     }
 
     private static func tail(_ s: String) -> String {
@@ -188,6 +239,7 @@ struct Engine {
     private static func run(
         _ launchPath: String,
         _ args: [String],
+        trackAs box: ProcessBox? = nil,
         onLine: (@Sendable (String) -> Void)? = nil
     ) async throws -> (out: String, err: String, code: Int32) {
         try await withCheckedThrowingContinuation { cont in
@@ -208,6 +260,7 @@ struct Engine {
             }
 
             proc.terminationHandler = { p in
+                box?.value = nil
                 outPipe.fileHandleForReading.readabilityHandler = nil
                 collector.ingest(outPipe.fileHandleForReading.readDataToEndOfFile())
                 let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
@@ -217,8 +270,21 @@ struct Engine {
                     p.terminationStatus
                 ))
             }
-            do { try proc.run() } catch { cont.resume(throwing: error) }
+            do {
+                try proc.run()
+                box?.value = proc
+            } catch { cont.resume(throwing: error) }
         }
+    }
+}
+
+// Holds the active Process across threads so the queue can cancel it.
+final class ProcessBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _value: Process?
+    var value: Process? {
+        get { lock.lock(); defer { lock.unlock() }; return _value }
+        set { lock.lock(); defer { lock.unlock() }; _value = newValue }
     }
 }
 

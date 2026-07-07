@@ -73,6 +73,43 @@ enum Format {
     }
 }
 
+// What to actually fetch — independent of a probe, so playlist entries and
+// queue items can carry it around without pre-fetched format lists.
+enum Selection: Codable, Hashable {
+    case video(maxHeight: Int)
+    case audioOriginal
+    case audioMP3
+
+    var label: String {
+        switch self {
+        case .video(let h):
+            if h >= 4320 { return "8K MP4" }
+            if h >= 2160 { return "4K MP4" }
+            if h >= 1440 { return "2K MP4" }
+            return "\(h)p MP4"
+        case .audioOriginal: return "Original audio"
+        case .audioMP3: return "MP3"
+        }
+    }
+}
+
+// A playlist (or channel/set) probe result.
+struct PlaylistInfo: Identifiable {
+    let id = UUID()
+    let url: String
+    let title: String
+    let uploader: String
+    let entries: [(title: String, url: String)]
+}
+
+// One item waiting in (or moving through) the download queue.
+struct QueueItem: Identifiable, Equatable {
+    let id = UUID()
+    let url: String
+    let title: String
+    let selection: Selection
+}
+
 // One finished (or failed) download. Persisted across launches.
 struct HistoryItem: Identifiable, Codable {
     var id = UUID()
