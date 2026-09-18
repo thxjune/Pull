@@ -8,18 +8,21 @@ enum Mono {
     static let line = Color.white.opacity(0.09)
     static let text = Color(hex: 0xF5F5F7)
     static let dim = Color(hex: 0x9A9AA0)
-    static let faint = Color(hex: 0x6E6E73)
+    // 0x858589 clears WCAG AA (5.3:1 on bg, 4.6:1 on cards); the old 0x6E6E73 didn't.
+    static let faint = Color(hex: 0x858589)
 }
 
 struct ContentView: View {
     @EnvironmentObject var state: AppState
     @State private var showSettings = false
+    @FocusState private var urlFocused: Bool
 
     var body: some View {
         VStack(spacing: 0) {
             header
             ScrollView {
                 VStack(spacing: 18) {
+                    if !state.toolsReady { errorCard(EngineError.toolsMissing.localizedDescription) }
                     urlBar
                     if let e = state.errorText { errorCard(e) }
                     if state.probing { probingCard }
@@ -33,6 +36,9 @@ struct ContentView: View {
             }
         }
         .background(Mono.bg)
+        .defaultFocus($urlFocused, true)
+        // After Download/✕ empties the field, put the cursor back so ⌘V just works.
+        .onChange(of: state.urlText) { _, new in if new.isEmpty { urlFocused = true } }
     }
 
     private var header: some View {
@@ -49,6 +55,9 @@ struct ContentView: View {
                     .foregroundStyle(Mono.dim)
             }
             .buttonStyle(.plain)
+            .keyboardShortcut(",", modifiers: .command)
+            .help("Settings (⌘,)")
+            .accessibilityLabel("Settings")
             .popover(isPresented: $showSettings, arrowEdge: .bottom) {
                 SettingsPopover()
                     .environmentObject(state)
@@ -67,24 +76,19 @@ struct ContentView: View {
                 .textFieldStyle(.plain)
                 .font(.system(size: 15))
                 .foregroundStyle(Mono.text)
-                .onSubmit { state.probe() }
+                .focused($urlFocused)
+                // Return: fetch a new link, or download the one already fetched.
+                .onSubmit { state.submit() }
+                .onExitCommand { state.clearLink() }
             if !state.urlText.isEmpty {
-                Button {
-                    state.urlText = ""
-                    state.info = nil
-                    state.playlist = nil
-                    state.errorText = nil
-                } label: {
+                Button { state.clearLink() } label: {
                     Image(systemName: "xmark.circle.fill").foregroundStyle(Mono.faint)
                 }
                 .buttonStyle(.plain)
+                .help("Clear (Esc)")
+                .accessibilityLabel("Clear link")
             }
-            Button {
-                if let s = NSPasteboard.general.string(forType: .string) {
-                    state.urlText = s.trimmingCharacters(in: .whitespacesAndNewlines)
-                    state.probe()
-                }
-            } label: {
+            Button { state.pasteAndProbe() } label: {
                 Text("Paste")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(Mono.dim)
@@ -92,6 +96,8 @@ struct ContentView: View {
                     .background(Capsule().fill(Color.white.opacity(0.07)))
             }
             .buttonStyle(.plain)
+            .disabled(state.probing || !state.toolsReady)
+            .opacity(state.probing || !state.toolsReady ? 0.4 : 1)
             Button { state.probe() } label: {
                 Text("Fetch")
                     .font(.system(size: 12, weight: .semibold))
@@ -100,13 +106,18 @@ struct ContentView: View {
                     .background(Capsule().fill(Color.white))
             }
             .buttonStyle(.plain)
-            .disabled(state.urlText.isEmpty || state.probing)
-            .opacity(state.urlText.isEmpty ? 0.4 : 1)
+            .disabled(state.urlText.isEmpty || state.probing || !state.toolsReady)
+            .opacity(state.urlText.isEmpty || state.probing || !state.toolsReady ? 0.4 : 1)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
         .background(RoundedRectangle(cornerRadius: 14).fill(Mono.card))
-        .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Mono.line))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .strokeBorder(state.dropTargeted ? Color.white.opacity(0.5)
+                              : urlFocused ? Color.white.opacity(0.22) : Mono.line)
+        )
+        .animation(.easeOut(duration: 0.15), value: state.dropTargeted)
     }
 
     private var probingCard: some View {
@@ -115,6 +126,15 @@ struct ContentView: View {
             Text("Reading link…")
                 .font(.system(size: 13))
                 .foregroundStyle(Mono.dim)
+            Spacer()
+            Button { state.clearLink() } label: {
+                Text("cancel")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(Mono.faint)
+                    .underline()
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Cancel reading link")
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(16)
@@ -125,6 +145,7 @@ struct ContentView: View {
         Label(text, systemImage: "exclamationmark.triangle")
             .font(.system(size: 12.5))
             .foregroundStyle(Mono.dim)
+            .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(14)
             .background(RoundedRectangle(cornerRadius: 12).fill(Color.white.opacity(0.05)))
@@ -144,8 +165,9 @@ struct SettingsPopover: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Use browser cookies (Chrome)")
                         .font(.system(size: 12.5))
-                    Text("For Instagram / TikTok posts that need login")
+                    Text("For Instagram / TikTok posts that need login. macOS will ask for Keychain access the first time — click Allow, not Always Allow.")
                         .font(.system(size: 10.5)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             Toggle(isOn: $state.soundOnDone) {
@@ -156,6 +178,7 @@ struct SettingsPopover: View {
             HStack {
                 Text("Saving to: \(state.outputDir.lastPathComponent)")
                     .font(.system(size: 11.5)).foregroundStyle(.secondary)
+                    .help(state.outputDir.path)
                 Spacer()
                 Button("Change…") { state.chooseOutputDir() }
                     .font(.system(size: 11.5))
@@ -181,6 +204,7 @@ struct MediaCard: View {
                 }
                 .frame(width: 148, height: 84)
                 .clipShape(RoundedRectangle(cornerRadius: 10))
+                .accessibilityHidden(true)
 
                 VStack(alignment: .leading, spacing: 5) {
                     Text(info.title)
@@ -207,6 +231,7 @@ struct MediaCard: View {
             HStack(spacing: 4) {
                 ForEach(AppState.Mode.allCases, id: \.self) { m in
                     let active = state.mode == m
+                    let unavailable = m == .video && info.videoOptions.isEmpty
                     Button { withAnimation(.easeOut(duration: 0.15)) { state.mode = m } } label: {
                         Text(m.rawValue)
                             .font(.system(size: 12.5, weight: .semibold))
@@ -215,7 +240,10 @@ struct MediaCard: View {
                             .background(Capsule().fill(active ? Color.white : Color.clear))
                     }
                     .buttonStyle(.plain)
-                    .disabled(m == .video && info.videoOptions.isEmpty)
+                    .disabled(unavailable)
+                    .opacity(unavailable ? 0.35 : 1)
+                    .help(unavailable ? "This link has no video stream" : "")
+                    .accessibilityAddTraits(active ? .isSelected : [])
                 }
                 Spacer()
             }
@@ -226,7 +254,7 @@ struct MediaCard: View {
                 if state.mode == .video {
                     ForEach(info.videoOptions) { v in
                         optionRow(selected: state.selectedVideo == v, title: v.label,
-                                  subtitle: "MP4", size: v.sizeLabel) { state.selectedVideo = v }
+                                  subtitle: v.detail, size: v.sizeLabel) { state.selectedVideo = v }
                     }
                 } else {
                     ForEach(info.audioOptions) { a in
@@ -247,7 +275,6 @@ struct MediaCard: View {
                         .background(RoundedRectangle(cornerRadius: 12).fill(Color.white))
                 }
                 .buttonStyle(.plain)
-                .keyboardShortcut(.defaultAction)
                 Button { state.chooseOutputDir() } label: {
                     Text("saves to \(state.outputDir.lastPathComponent) — change")
                         .font(.system(size: 10.5, design: .monospaced))
@@ -255,6 +282,7 @@ struct MediaCard: View {
                         .underline()
                 }
                 .buttonStyle(.plain)
+                .help(state.outputDir.path)
             }
             .padding(16)
         }
@@ -285,6 +313,7 @@ struct MediaCard: View {
                 Text(subtitle)
                     .font(.system(size: 12))
                     .foregroundStyle(Mono.faint)
+                    .lineLimit(1)
                 Spacer()
                 Text(size)
                     .font(.system(size: 12, design: .monospaced))
@@ -298,6 +327,7 @@ struct MediaCard: View {
             )
         }
         .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
 
@@ -351,20 +381,31 @@ struct PlaylistCard: View {
                             .fill(selected ? Color.white.opacity(0.07) : Color.clear))
                     }
                     .buttonStyle(.plain)
+                    .accessibilityAddTraits(selected ? .isSelected : [])
                 }
             }
             .padding(.horizontal, 16)
             .padding(.top, 12)
 
-            Button { state.enqueuePlaylist() } label: {
-                Text("Queue all \(playlist.entries.count)")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(.black)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 12)
-                    .background(RoundedRectangle(cornerRadius: 12).fill(Color.white))
+            VStack(spacing: 10) {
+                Button { state.enqueuePlaylist() } label: {
+                    Text("Queue all \(playlist.entries.count)")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.black)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                        .background(RoundedRectangle(cornerRadius: 12).fill(Color.white))
+                }
+                .buttonStyle(.plain)
+                Button { state.chooseOutputDir() } label: {
+                    Text("saves to \(state.outputDir.lastPathComponent) — change")
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .foregroundStyle(Mono.faint)
+                        .underline()
+                }
+                .buttonStyle(.plain)
+                .help(state.outputDir.path)
             }
-            .buttonStyle(.plain)
             .padding(16)
         }
         .background(RoundedRectangle(cornerRadius: 16).fill(Mono.card))
@@ -406,8 +447,11 @@ struct QueueSection: View {
                         }
                         .buttonStyle(.plain)
                         .help("Cancel this download")
+                        .accessibilityLabel("Cancel download")
                     }
-                    ProgressView(value: state.progress).tint(.white)
+                    // 0% = still extracting / merging: show motion, not a dead bar.
+                    ProgressView(value: state.progress > 0 && state.progress < 1 ? state.progress : nil)
+                        .tint(.white)
                     HStack {
                         Text("\(Int(state.progress * 100))%")
                         Spacer()
@@ -439,6 +483,8 @@ struct QueueSection: View {
                             .foregroundStyle(Mono.faint)
                     }
                     .buttonStyle(.plain)
+                    .help("Remove from queue")
+                    .accessibilityLabel("Remove from queue")
                 }
                 .padding(.horizontal, 14).padding(.vertical, 9)
                 .background(RoundedRectangle(cornerRadius: 10).fill(Mono.card))
@@ -466,10 +512,15 @@ struct HistoryList: View {
                         .underline()
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("Clear history")
             }
             .padding(.horizontal, 4)
 
             ForEach(state.history) { item in
+                // Only local files that still exist get Finder/open actions.
+                let file = item.fileURL.flatMap {
+                    $0.isFileURL && FileManager.default.fileExists(atPath: $0.path) ? $0 : nil
+                }
                 HStack(spacing: 12) {
                     Image(systemName: item.failed ? "xmark.circle" : "checkmark.circle.fill")
                         .foregroundStyle(item.failed ? Mono.faint : Mono.text)
@@ -478,12 +529,12 @@ struct HistoryList: View {
                             .font(.system(size: 13, weight: .medium))
                             .foregroundStyle(Mono.text)
                             .lineLimit(1)
-                        Text(item.detail)
+                        Text(file == nil && !item.failed ? "\(item.detail) · file moved or deleted" : item.detail)
                             .font(.system(size: 11, design: .monospaced))
                             .foregroundStyle(Mono.faint)
                     }
                     Spacer()
-                    if let url = item.fileURL {
+                    if let url = file {
                         Button {
                             NSWorkspace.shared.activateFileViewerSelecting([url])
                         } label: {
@@ -500,9 +551,11 @@ struct HistoryList: View {
                 .background(RoundedRectangle(cornerRadius: 12).fill(Mono.card))
                 .contentShape(Rectangle())
                 .onTapGesture(count: 2) {
-                    if let url = item.fileURL { NSWorkspace.shared.open(url) }
+                    if let url = file { NSWorkspace.shared.open(url) }
                 }
-                .help(item.fileURL != nil ? "Double-click to open" : "")
+                .help(file != nil ? "Double-click to open" : "")
+                .accessibilityElement(children: .combine)
+                .accessibilityAction(named: "Open") { if let url = file { NSWorkspace.shared.open(url) } }
             }
         }
     }
@@ -511,6 +564,7 @@ struct HistoryList: View {
 // ── Menu bar quick-grab ─────────────────────────────────────────
 struct MenuBarView: View {
     @EnvironmentObject var state: AppState
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -519,24 +573,37 @@ struct MenuBarView: View {
                     Text(active.title)
                         .font(.system(size: 12, weight: .medium))
                         .lineLimit(1)
-                    ProgressView(value: state.progress)
+                    ProgressView(value: state.progress > 0 && state.progress < 1 ? state.progress : nil)
                     Text("\(Int(state.progress * 100))%\(state.queue.isEmpty ? "" : " · \(state.queue.count) queued")")
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundStyle(.secondary)
                 }
             }
 
-            if let url = state.clipboardURL {
+            if !state.toolsReady {
+                Text(EngineError.toolsMissing.localizedDescription)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if let url = state.clipboardLink {
+                let queued = state.isQueued(url)
                 Text(url)
                     .font(.system(size: 10.5, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                    .help(url)
                 HStack(spacing: 8) {
                     Button("Best video") { state.enqueueClipboard(.video(maxHeight: 4320)) }
                     Button("MP3") { state.enqueueClipboard(.audioMP3) }
                     Button("Original audio") { state.enqueueClipboard(.audioOriginal) }
                 }
                 .controlSize(.small)
+                .disabled(queued)
+                if queued {
+                    Text("Already in the queue.")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                }
             } else {
                 Text("Copy a link, then grab it here.")
                     .font(.system(size: 11.5))
@@ -546,15 +613,16 @@ struct MenuBarView: View {
             Divider()
             HStack {
                 Button("Open Pull") {
-                    NSApp.activate(ignoringOtherApps: true)
-                    NSApp.windows.first { $0.title.isEmpty || $0.title == "Pull" }?.makeKeyAndOrderFront(nil)
+                    NSApp.activate()
+                    openWindow(id: "main")
                 }
                 Spacer()
-                Button("Quit") { NSApplication.shared.terminate(nil) }
+                Button("Quit") { state.quit() }
             }
             .controlSize(.small)
         }
         .padding(14)
         .frame(width: 280)
+        .onAppear { state.refreshTools() }
     }
 }

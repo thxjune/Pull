@@ -21,7 +21,7 @@
 
 - 🎬 **Every quality the video has** — 4K/2K/1080p… with file sizes shown *before* you download
 - 🎧 **Two audio modes** — **Original** (stream copy, zero re-encode — bit-identical to the source) and **MP3** (LAME V0, plays everywhere)
-- 🧠 **Smart codecs** — H.264+AAC up to 1080p for universal playback; AV1 above that (YouTube only serves 4K in VP9/AV1)
+- 🧠 **Smart codecs** — H.264+AAC up to 1080p for universal playback; AV1 above that (YouTube only serves 4K in VP9/AV1). Sources that only come in VP9 (Instagram reels) are converted to H.264 on the fly, so every MP4 actually plays in QuickTime
 - 📋 **Zero-click flow** — copy a link, switch to Pull: it's already fetched. Or drag & drop. Or use the menu-bar quick-grab
 - 🧾 **Queue** — stack up downloads; live progress with speed + ETA; cancel anytime
 - 📚 **Playlists** — paste a playlist link, pick one preset, queue every entry
@@ -34,7 +34,7 @@
 brew install yt-dlp ffmpeg
 ```
 
-macOS 14+. For login-gated Instagram/TikTok posts, enable **Use browser cookies** in settings.
+macOS 14+. Keep yt-dlp current (`brew upgrade yt-dlp`) — YouTube breaks old versions every few weeks. For login-gated Instagram/TikTok posts, enable **Use browser cookies** in settings.
 
 ## Build
 

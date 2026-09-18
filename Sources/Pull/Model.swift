@@ -23,17 +23,22 @@ struct MediaInfo: Identifiable {
 
 struct VideoOption: Identifiable, Hashable {
     let id = UUID()
-    let height: Int               // 2160, 1440, 1080, 720…
+    let height: Int               // smallest dimension: 2160, 1440, 1080, 720… (4320 = "best available")
     let fps: Int?
     let estimatedBytes: Int64?    // video + best audio, when known
+    let vcodec: String            // normalized: "h264" / "vp9" / "av1" / "?" (unknown)
 
     var label: String {
+        if height >= 4320 { return "Best available" }
         let fpsPart = (fps ?? 0) > 40 ? "\(fps!)" : ""
         let base = "\(height)p\(fpsPart)"
         if height >= 2160 { return "4K · \(base)" }
         if height >= 1440 { return "2K · \(base)" }
         return base
     }
+    // Source codec macOS can't play natively → the app re-encodes to H.264 after download.
+    var willConvert: Bool { !Codec.playable(vcodec) }
+    var detail: String { willConvert ? "MP4 · \(vcodec) source, converted to H.264" : "MP4" }
     var sizeLabel: String { Format.size(estimatedBytes) }
 }
 
@@ -65,7 +70,7 @@ struct AudioOption: Identifiable, Hashable {
 
 enum Format {
     static func size(_ bytes: Int64?) -> String {
-        guard let b = bytes, b > 0 else { return "size unknown" }
+        guard let b = bytes, b > 0 else { return "—" }
         let mb = Double(b) / 1_048_576
         if mb >= 1024 { return String(format: "%.2f GB", mb / 1024) }
         if mb >= 100 { return String(format: "%.0f MB", mb) }
@@ -83,7 +88,7 @@ enum Selection: Codable, Hashable {
     var label: String {
         switch self {
         case .video(let h):
-            if h >= 4320 { return "8K MP4" }
+            if h >= 4320 { return "Best MP4" }
             if h >= 2160 { return "4K MP4" }
             if h >= 1440 { return "2K MP4" }
             return "\(h)p MP4"

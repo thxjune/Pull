@@ -6,21 +6,26 @@ struct PullApp: App {
     @StateObject private var state = AppState()
 
     var body: some Scene {
-        WindowGroup {
+        WindowGroup(id: "main") {
             ContentView()
                 .environmentObject(state)
                 .frame(minWidth: 680, minHeight: 620)
                 .background(Color(hex: 0x0B0B0C))
                 .preferredColorScheme(.dark)
-                .onAppear { state.adoptClipboardIfURL() }
-                .onReceive(NotificationCenter.default.publisher(
-                    for: NSApplication.didBecomeActiveNotification)) { _ in
+                .onAppear {
+                    // Hidden title bar: let the whole background drag the window.
+                    NSApp.windows.forEach { $0.isMovableByWindowBackground = true }
                     state.adoptClipboardIfURL()
                 }
-                .onDrop(of: [.url, .text], isTargeted: nil) { providers in
+                .onReceive(NotificationCenter.default.publisher(
+                    for: NSApplication.didBecomeActiveNotification)) { _ in
+                    state.refreshTools()
+                    state.adoptClipboardIfURL()
+                }
+                .onDrop(of: [.url, .text], isTargeted: $state.dropTargeted) { providers in
                     _ = providers.first?.loadObject(ofClass: NSString.self) { s, _ in
                         if let str = (s as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                           str.hasPrefix("http") {
+                           AppState.isWebURL(str) {
                             Task { @MainActor in
                                 state.urlText = str
                                 state.probe()
@@ -57,6 +62,9 @@ final class AppState: ObservableObject {
     @Published var selectedAudio: AudioOption?
     @Published var playlistSelection: Selection = .video(maxHeight: 1080)
     @Published var errorText: String?
+    @Published var dropTargeted = false
+    @Published var toolsReady = Tools.ready
+    @Published var clipboardLink: String?   // refreshed on activate / menu open (a computed var wouldn't re-render)
 
     // queue
     @Published var queue: [QueueItem] = []
@@ -81,8 +89,10 @@ final class AppState: ObservableObject {
 
     init() {
         let d = UserDefaults.standard
+        let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
+        // A saved folder that no longer exists (unmounted drive) falls back to Downloads.
         outputDir = d.string(forKey: "pull.outputDir").map { URL(fileURLWithPath: $0) }
-            ?? FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
+            .flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0 : nil } ?? downloads
         useBrowserCookies = d.bool(forKey: "pull.cookies")
         soundOnDone = d.object(forKey: "pull.sound") as? Bool ?? true
 
@@ -92,16 +102,37 @@ final class AppState: ObservableObject {
         historyFile = support.appendingPathComponent("history.json")
         if let data = try? Data(contentsOf: historyFile),
            let items = try? JSONDecoder().decode([HistoryItem].self, from: data) {
-            history = items
+            // Never open anything from history that isn't a local file.
+            history = items.filter { $0.fileURL == nil || $0.fileURL!.isFileURL }
         }
+        Engine.cleanupTempDirs(in: outputDir)
+    }
+
+    func refreshTools() {
+        toolsReady = Tools.ready
+        clipboardLink = clipboardURL
+        // Output folder vanished (external drive unplugged): fall back rather
+        // than letting yt-dlp mkdir a ghost /Volumes/<name> on the boot disk.
+        if !FileManager.default.fileExists(atPath: outputDir.path) {
+            outputDir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
+            UserDefaults.standard.removeObject(forKey: "pull.outputDir")
+        }
+    }
+
+    // Only http(s) links ever reach yt-dlp — no file://, no option-shaped text.
+    nonisolated static func isWebURL(_ s: String) -> Bool {
+        let lower = s.lowercased()
+        return (lower.hasPrefix("http://") || lower.hasPrefix("https://")) && s.count < 2048
+            && !s.contains(where: { $0.isWhitespace })
     }
 
     // ── Clipboard / input ──────────────────────────────────────
     func adoptClipboardIfURL() {
-        guard !probing,
-              let s = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              s.hasPrefix("http"), s.count < 500, s != lastClipboard, s != urlText,
-              s != info?.url, s != playlist?.url else { return }
+        // Don't yank a card the user is looking at just because they copied
+        // some unrelated link while away.
+        guard !probing, info == nil, playlist == nil,
+              let s = clipboardURL,
+              s != lastClipboard, s != urlText else { return }
         lastClipboard = s
         urlText = s
         probe()
@@ -109,20 +140,51 @@ final class AppState: ObservableObject {
 
     var clipboardURL: String? {
         guard let s = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              s.hasPrefix("http"), s.count < 500 else { return nil }
+              AppState.isWebURL(s) else { return nil }
         return s
+    }
+
+    func pasteAndProbe() {
+        guard let s = NSPasteboard.general.string(forType: .string)?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty else { return }
+        urlText = s
+        probe()
+    }
+
+    func clearLink() {
+        if probing { Engine.cancelProbe() }
+        urlText = ""
+        info = nil
+        playlist = nil
+        errorText = nil
     }
 
     func probe() {
         let url = urlText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !url.isEmpty, !probing else { return }
+        guard AppState.isWebURL(url) else {
+            errorText = "That doesn't look like a web link. Paste an http(s) URL."
+            return
+        }
+        refreshTools()
+        guard toolsReady else { return }   // the tools-missing card is already on screen
         probing = true
         errorText = nil
         info = nil
         playlist = nil
+        lastClipboard = url   // whatever path it came in by, don't auto-fetch it again later
+        let cookies = useBrowserCookies
         Task {
             do {
-                switch try await Engine.probeAny(url: url) {
+                let result = try await Engine.probeAny(url: url, useBrowserCookies: cookies)
+                // The field changed (or was cleared) while yt-dlp was thinking:
+                // this result is for the wrong link — drop it and re-probe.
+                guard self.urlText.trimmingCharacters(in: .whitespacesAndNewlines) == url else {
+                    self.probing = false
+                    if !self.urlText.isEmpty { self.probe() }
+                    return
+                }
+                switch result {
                 case .single(let result):
                     self.info = result
                     self.selectedVideo = result.videoOptions.first
@@ -132,10 +194,32 @@ final class AppState: ObservableObject {
                     self.playlist = pl
                 }
             } catch {
-                self.errorText = error.localizedDescription
+                self.probing = false
+                let now = self.urlText.trimmingCharacters(in: .whitespacesAndNewlines)
+                if now == url {
+                    // A probe the user cancelled with ✕ isn't an error worth showing.
+                    if case EngineError.cancelled = error {} else { self.errorText = hint(for: error) }
+                } else if !now.isEmpty {
+                    self.probe()   // field changed mid-probe: go read the new link
+                }
+                return
             }
             self.probing = false
         }
+    }
+
+    // True when the link in the field is the one the current card describes —
+    // i.e. Return should download, not re-fetch.
+    var fieldMatchesCard: Bool {
+        let t = urlText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t == info?.url || t == playlist?.url
+    }
+
+    // Return in the URL field: one deterministic route (SwiftUI's default-
+    // action button doesn't reliably fire while a text field has focus).
+    func submit() {
+        guard fieldMatchesCard else { probe(); return }
+        if info != nil { enqueueCurrent() } else if playlist != nil { enqueuePlaylist() }
     }
 
     // ── Queue ──────────────────────────────────────────────────
@@ -165,13 +249,18 @@ final class AppState: ObservableObject {
     }
 
     func enqueueClipboard(_ selection: Selection) {
-        guard let url = clipboardURL else { return }
+        guard let url = clipboardLink, !isQueued(url) else { return }
         enqueue(QueueItem(url: url, title: url, selection: selection))
+    }
+
+    func isQueued(_ url: String) -> Bool {
+        active?.url == url || queue.contains { $0.url == url }
     }
 
     private func enqueue(_ item: QueueItem) {
         queue.append(item)
         errorText = nil
+        lastClipboard = item.url
         processNext()
     }
 
@@ -183,8 +272,17 @@ final class AppState: ObservableObject {
         Engine.cancelActive()
     }
 
+    func quit() {
+        // Otherwise yt-dlp keeps running headless and a file appears later
+        // with no history entry.
+        Engine.cancelProbe()
+        Engine.cancelActive()
+        NSApplication.shared.terminate(nil)
+    }
+
     private func processNext() {
         guard active == nil, !queue.isEmpty else { return }
+        refreshTools()
         let item = queue.removeFirst()
         active = item
         progress = 0
@@ -192,7 +290,7 @@ final class AppState: ObservableObject {
 
         Task {
             do {
-                let file = try await Engine.download(
+                let result = try await Engine.download(
                     url: item.url,
                     selection: item.selection,
                     outputDir: outputDir,
@@ -204,15 +302,16 @@ final class AppState: ObservableObject {
                         }
                     }
                 )
-                let size = (try? FileManager.default.attributesOfItem(atPath: file.path)[.size] as? Int64) ?? nil
-                let title = file.deletingPathExtension().lastPathComponent
+                let title = result.fileURL.deletingPathExtension().lastPathComponent
                 self.history.insert(HistoryItem(
                     title: item.title == item.url ? title : item.title,
-                    detail: "\(item.selection.label) · \(Format.size(size))",
-                    fileURL: file, failed: false), at: 0)
+                    detail: result.detail,
+                    fileURL: result.fileURL, failed: false), at: 0)
                 if self.soundOnDone { NSSound(named: "Glass")?.play() }
+            } catch EngineError.cancelled {
+                // The user asked for this — not an error, not history.
             } catch {
-                self.errorText = hint(for: error)
+                self.errorText = "\(item.title) — \(hint(for: error))"
                 self.history.insert(HistoryItem(
                     title: item.title, detail: item.selection.label, fileURL: nil, failed: true), at: 0)
             }
@@ -228,8 +327,9 @@ final class AppState: ObservableObject {
     private func hint(for error: Error) -> String {
         let msg = error.localizedDescription
         let lower = msg.lowercased()
-        if lower.contains("login") || lower.contains("cookies") || lower.contains("rate-limit")
-            || lower.contains("not available") && lower.contains("instagram") {
+        let loginGated = lower.contains("login") || lower.contains("cookies") || lower.contains("rate-limit")
+            || lower.contains("sign in") || (lower.contains("not available") && lower.contains("instagram"))
+        if loginGated && !useBrowserCookies {
             return msg + "  Tip: enable “Use browser cookies” in settings (gear icon) for private or login-gated posts."
         }
         return msg

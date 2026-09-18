@@ -21,12 +21,15 @@ cp Resources/Info.plist "$APP/Contents/Info.plist"
 [ -f Resources/AppIcon.icns ] && cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
 # Real signing identity keeps TCC/Gatekeeper happy across rebuilds.
+# Hardened runtime blocks DYLD injection into the app (which would inherit
+# its folder-access grants). No entitlements: sandboxing would break
+# spawning Homebrew binaries and writing to a user-chosen folder.
 IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/Apple Development/{print $2; exit}')"
-if [ -n "${IDENTITY}" ]; then
-  echo "==> Code-signing with: ${IDENTITY}"
-  codesign --force --sign "${IDENTITY}" "$APP" || echo "   (codesign failed — falling back to ad-hoc)"
+if [ -n "${IDENTITY}" ] && codesign --force --options runtime --timestamp --sign "${IDENTITY}" "$APP" 2>/dev/null; then
+  echo "==> Code-signed (hardened runtime) with: ${IDENTITY}"
 else
-  codesign --force --sign - "$APP" >/dev/null 2>&1 || true
+  echo "==> No usable Apple Development identity — ad-hoc signing"
+  codesign --force --options runtime --sign - "$APP"
 fi
 
 echo "==> Done.  open ${APP}"
