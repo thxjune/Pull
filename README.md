@@ -12,7 +12,8 @@
 ---
 
 <p align="center">
-  <a href="https://github.com/thxjune/Pull/releases/latest"><b>⬇ Download the app</b></a> — no build needed. Unzip, right-click → Open. (Engine: <code>brew install yt-dlp ffmpeg</code>)
+  <a href="https://github.com/thxjune/Pull/releases/latest/download/Pull.zip"><b>⬇ Download Pull.zip</b></a> — latest version, no build needed.<br>
+  <sub><a href="https://github.com/thxjune/Pull/releases">All releases</a> · Engine: <code>brew install yt-dlp ffmpeg</code></sub>
 </p>
 
 ---
@@ -36,7 +37,15 @@ brew install yt-dlp ffmpeg
 
 macOS 14+. Keep yt-dlp current (`brew upgrade yt-dlp`) — YouTube breaks old versions every few weeks. For login-gated Instagram/TikTok posts, enable **Use browser cookies** in settings.
 
-## Build
+## Install
+
+1. [Download Pull.zip](https://github.com/thxjune/Pull/releases/latest/download/Pull.zip), unzip, drag **Pull.app** to Applications
+2. Install the engine once: `brew install yt-dlp ffmpeg`
+3. **First launch:** double-click → macOS says it can't verify the app → open **System Settings → Privacy & Security**, scroll down, click **Open Anyway** (once). The app is signed but not notarized, which needs a paid Apple Developer account.
+
+   Or, from a terminal: `xattr -dr com.apple.quarantine /Applications/Pull.app`
+
+## Build from source
 
 ```bash
 git clone https://github.com/thxjune/Pull.git
@@ -44,6 +53,10 @@ cd Pull
 ./build.sh
 open build/Pull.app
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
 
 ## Note
 
